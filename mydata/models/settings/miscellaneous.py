@@ -51,7 +51,8 @@ class MiscellaneousSettingsModel(object):
             'use_none_cipher',
             'progress_poll_interval',
             'immutable_datasets',
-            'cache_datafile_lookups'
+            'cache_datafile_lookups',
+            'assume_localhost_if_no_scp_attrs'
         ]
 
     @property
@@ -183,6 +184,26 @@ class MiscellaneousSettingsModel(object):
         """
         self.mydataConfig['cache_datafile_lookups'] = cacheDataFileLookups
 
+    @property
+    def assumeLocalhostIfNoScpAttrs(self):
+        """
+        If this is True, when MyData is assigned a storage box which has
+        a location but no scp_username or scp_hostname storage box attributes,
+        MyData will assume that the location can be accessed via a local
+        mount, so the files can be copied rather than SCP-uploaded.
+        """
+        return self.mydataConfig['assume_localhost_if_no_scp_attrs']
+
+    @assumeLocalhostIfNoScpAttrs.setter
+    def assumeLocalhostIfNoScpAttrs(self, assumeLocalhostIfNoScpAttrs):
+        """
+        Set this to True if when MyData is assigned a storage box which has
+        a location but no scp_username or scp_hostname storage box attributes,
+        MyData should assume that the location can be accessed via a local
+        mount, so the files can be copied rather than SCP-uploaded.
+        """
+        self.mydataConfig['assume_localhost_if_no_scp_attrs'] = assumeLocalhostIfNoScpAttrs
+
     def SetDefaults(self):
         """
         Set default values for configuration parameters that will appear in
@@ -220,3 +241,7 @@ class MiscellaneousSettingsModel(object):
 
         # Whether MyData should cache results of successful datafile lookups:
         self.mydataConfig['cache_datafile_lookups'] = True
+
+        # Whether MyData should assume that files can be copied locally when
+        # SCP attributes are missing from the assigned storage box:
+        self.mydataConfig['assume_localhost_if_no_scp_attrs'] = False
