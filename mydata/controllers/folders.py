@@ -2,6 +2,7 @@
 The main controller class for managing datafile verifications
 and uploads from each of the folders in the Folders view.
 """
+import os
 import sys
 import time
 import threading
@@ -20,16 +21,20 @@ import mydata.events as mde
 import mydata.views.messages
 from ..dataviewmodels.dataview import DATAVIEW_MODELS
 from ..events import MYDATA_EVENTS
+from ..events import PostEvent
 from ..events.stop import CheckIfShouldAbort
 from ..settings import SETTINGS
 from ..models.experiment import ExperimentModel
 from ..models.dataset import DatasetModel
 from ..logs import logger
 from ..utils import EndBusyCursorIfRequired
+from ..utils import SafeStr
 from ..utils.exceptions import HttpException
 from ..utils.exceptions import InternalServerError
+from ..utils.exceptions import StorageBoxAttributeNotFound
 from ..utils.openssh import CleanUpScpAndSshProcesses
 from ..threads.flags import FLAGS
+from ..threads.locks import LOCKS
 from .uploads import UploadMethod
 from .uploads import UploadDatafileRunnable
 from .verifications import VerifyDatafileRunnable
@@ -60,15 +65,12 @@ class FoldersController(object):
         self._completed = threading.Event()
 
         self.finishedCountingVerifications = dict()
-        self.finishedCountingThreadingLock = threading.Lock()
         self.finishedScanningForDatasetFolders = threading.Event()
         self.verificationsQueue = None
-        self.getOrCreateExpThreadingLock = threading.Lock()
         self.verifyDatafileRunnable = None
         self.uploadsQueue = None
         self.uploadDatafileRunnable = None
         self.numVerificationsToBePerformed = 0
-        self.numVerificationsToBePerformedLock = threading.Lock()
         self.uploadsAcknowledged = 0
         self.uploadMethod = UploadMethod.HTTP_POST
 
@@ -79,45 +81,6 @@ class FoldersController(object):
         self.verificationWorkerThreads = []
         self.numUploadWorkerThreads = 0
         self.uploadWorkerThreads = []
-
-        # pylint: disable=invalid-name
-        self.ShutdownUploadsEvent, self.EVT_SHUTDOWN_UPLOADS = \
-            mde.NewEvent(self.notifyWindow,
-                         self.ShutDownUploadThreads)
-
-        # The event type IDs (EVT_...) are used for logging in
-        # mydata/events/__init__.py's PostEvent method:
-        self.DidntFindDatafileOnServerEvent, \
-                self.EVT_DIDNT_FIND_FILE_ON_SERVER = \
-            mde.NewEvent(self.notifyWindow, self.UploadDatafile)
-        self.FoundIncompleteStagedEvent, self.EVT_FOUND_INCOMPLETE_STAGED = \
-            mde.NewEvent(self.notifyWindow, self.UploadDatafile)
-
-        self.FoundVerifiedDatafileEvent, self.EVT_FOUND_VERIFIED = \
-            mde.NewEvent(self.notifyWindow,
-                         self.CountCompletedUploadsAndVerifications)
-        self.FoundFullSizeStagedEvent, self.EVT_FOUND_FULLSIZE_STAGED = \
-            mde.NewEvent(self.notifyWindow,
-                         self.CountCompletedUploadsAndVerifications)
-        self.FoundUnverifiedNoDfosDatafileEvent, \
-                self.EVT_FOUND_UNVERIFIED_NO_DFOS = \
-            mde.NewEvent(self.notifyWindow,
-                         self.CountCompletedUploadsAndVerifications)
-        # If we're not using staged uploads, we can't retry the upload, because
-        # the DataFile has already been created and we don't want to trigger
-        # a Duplicate Key error, so we just need to wait for the file to be
-        # verified:
-        self.FoundUnverifiedUnstagedEvent, \
-                self.EVT_FOUND_UNVERIFIED_UNSTAGED = \
-            mde.NewEvent(self.notifyWindow,
-                         self.CountCompletedUploadsAndVerifications)
-
-        self.UploadCompleteEvent, self.EVT_UPLOAD_COMPLETE = \
-            mde.NewEvent(self.notifyWindow,
-                         self.CountCompletedUploadsAndVerifications)
-        self.UploadFailedEvent, self.EVT_UPLOAD_FAILED = \
-            mde.NewEvent(self.notifyWindow,
-                         self.CountCompletedUploadsAndVerifications)
 
     @property
     def started(self):
@@ -238,11 +201,9 @@ class FoldersController(object):
             getattr(event, "bytesUploadedPreviously", None)
         verificationModel = getattr(event, "verificationModel", None)
         self.uploadDatafileRunnable[folderModel][dfi] = \
-            UploadDatafileRunnable(self, self.foldersModel, folderModel,
-                                   dfi, self.uploadsModel,
-                                   existingUnverifiedDatafile,
-                                   verificationModel,
-                                   bytesUploadedPreviously)
+            UploadDatafileRunnable(
+                folderModel, dfi, existingUnverifiedDatafile,
+                verificationModel, bytesUploadedPreviously)
         if wx.PyApp.IsMainLoopRunning():
             self.uploadsQueue.put(
                 self.uploadDatafileRunnable[folderModel][dfi])
@@ -281,7 +242,6 @@ class FoldersController(object):
         self.uploadsQueue = Queue()
         self.numUploadWorkerThreads = SETTINGS.advanced.maxUploadThreads
         self.uploadMethod = UploadMethod.HTTP_POST
-        self.getOrCreateExpThreadingLock = threading.Lock()
 
         if sys.platform.startswith("linux"):
             StartErrandBoy()
@@ -305,8 +265,63 @@ class FoldersController(object):
                       "staging have been approved.  " \
                       "Falling back to HTTP POST."
         elif uploadToStagingRequest.approved:
-            logger.info("Uploads to staging have been approved.")
-            self.uploadMethod = UploadMethod.VIA_STAGING
+            location = "UNKNOWN"
+            try:
+                location = uploadToStagingRequest.location
+                _ = uploadToStagingRequest.scpHostname
+                _ = uploadToStagingRequest.scpUsername
+                logger.info("Uploads to staging have been approved.")
+                self.uploadMethod = UploadMethod.VIA_STAGING
+            except StorageBoxAttributeNotFound as err:
+                message = SafeStr(err)
+
+                def StopUploadsAsFailed(showError=False):
+                    """
+                    Shutdown uploads with the reason: failed.
+                    """
+                    logger.error(message)
+                    self.failed = True
+                    FLAGS.shouldAbort = True
+                    PostEvent(MYDATA_EVENTS.ShutdownUploadsEvent(failed=True))
+                    if showError:
+                        PostEvent(
+                            MYDATA_EVENTS.ShowMessageDialogEvent(
+                                title="MyData", message=message,
+                                icon=wx.ICON_ERROR))
+
+                if "scp_" in err.key:
+                    logger.warning(message)
+                    question = (
+                        "The %s storage box attribute is missing from "
+                        "the assigned storage box.\n\n"
+                        "Do you want MyData to attempt to access the storage "
+                        "box location (%s) locally (e.g. via a mounted file "
+                        "share)?" % (err.key, location))
+                    logger.info(question)
+
+                    def OnYes():
+                        """
+                        User clicked Yes
+                        """
+                        self.uploadMethod = UploadMethod.LOCAL_COPY
+
+                    if 'MYDATA_DONT_SHOW_MODAL_DIALOGS' not in os.environ:
+                        with LOCKS.displayModalDialog:
+                            PostEvent(
+                                MYDATA_EVENTS.ShowConfirmationDialogEvent(
+                                    title="MyData", question=question,
+                                    onYes=OnYes, onNo=StopUploadsAsFailed))
+                            # Wait for confirmation dialog to appear:
+                            while not FLAGS.showingConfirmationDialog:
+                                time.sleep(0.1)
+                            # Wait for confirmation dialog to close:
+                            while FLAGS.showingConfirmationDialog:
+                                time.sleep(0.1)
+                    else:
+                        StopUploadsAsFailed(showError=True)
+                else:
+                    StopUploadsAsFailed(showError=True)
+                    return
         else:
             message = \
                 "Uploads to MyTardis's staging area require " \
@@ -317,14 +332,14 @@ class FoldersController(object):
                 "only upload one file at a time.\n\n" \
                 "HTTP POST is generally only suitable for small " \
                 "files (up to 100 MB each)."
-        if message:
-            logger.warning(message)
-            mde.PostEvent(
-                MYDATA_EVENTS.ShowMessageDialogEvent(
-                    title="MyData",
-                    message=message,
-                    icon=wx.ICON_WARNING))
-            self.uploadMethod = UploadMethod.HTTP_POST
+            if message:
+                logger.warning(message)
+                mde.PostEvent(
+                    MYDATA_EVENTS.ShowMessageDialogEvent(
+                        title="MyData",
+                        message=message,
+                        icon=wx.ICON_WARNING))
+                self.uploadMethod = UploadMethod.HTTP_POST
         if self.uploadMethod == UploadMethod.HTTP_POST and \
                 self.numUploadWorkerThreads > 1:
             logger.warning(
@@ -397,14 +412,13 @@ class FoldersController(object):
         if CheckIfShouldAbort():
             return
         try:
-            self.finishedCountingThreadingLock.acquire()
-            self.finishedCountingVerifications[folderModel] = threading.Event()
-            self.finishedCountingThreadingLock.release()
+            with LOCKS.finishedCounting:
+                self.finishedCountingVerifications[folderModel] = \
+                    threading.Event()
             if self.IsShuttingDown() or CheckIfShouldAbort():
                 return
-            self.numVerificationsToBePerformedLock.acquire()
-            self.numVerificationsToBePerformed += folderModel.GetNumFiles()
-            self.numVerificationsToBePerformedLock.release()
+            with LOCKS.numVerificationsToBePerformed:
+                self.numVerificationsToBePerformed += folderModel.GetNumFiles()
             logger.debug(
                 "StartUploadsForFolder: Starting verifications "
                 "and uploads for folder: " + folderModel.folderName)
@@ -412,9 +426,9 @@ class FoldersController(object):
                 return
             try:
                 try:
-                    self.getOrCreateExpThreadingLock.acquire()
-                    experimentModel = ExperimentModel\
-                        .GetOrCreateExperimentForFolder(folderModel)
+                    with LOCKS.getOrCreateExp:
+                        experimentModel = ExperimentModel\
+                            .GetOrCreateExperimentForFolder(folderModel)
                 except Exception as err:
                     if self.failed:
                         return
@@ -455,10 +469,9 @@ class FoldersController(object):
                             MYDATA_EVENTS.ShowMessageDialogEvent(
                                 title="MyData", message=message,
                                 icon=wx.ICON_ERROR))
-                        mde.PostEvent(self.ShutdownUploadsEvent(failed=True))
+                        mde.PostEvent(MYDATA_EVENTS.ShutdownUploadsEvent(
+                            failed=True))
                     return
-                finally:
-                    self.getOrCreateExpThreadingLock.release()
                 folderModel.experimentModel = experimentModel
                 try:
                     folderModel.datasetModel = DatasetModel\
@@ -487,9 +500,8 @@ class FoldersController(object):
                 return
             if self.IsShuttingDown() or CheckIfShouldAbort():
                 return
-            self.finishedCountingThreadingLock.acquire()
-            self.finishedCountingVerifications[folderModel].set()
-            self.finishedCountingThreadingLock.release()
+            with LOCKS.finishedCounting:
+                self.finishedCountingVerifications[folderModel].set()
             if self.foldersModel.GetRowCount() == 0 or \
                     self.numVerificationsToBePerformed == 0:
                 # For the case of zero folders or zero files, we
@@ -610,10 +622,10 @@ class FoldersController(object):
             logger.debug("All datafile verifications and uploads "
                          "have completed.")
             logger.debug("Shutting down upload and verification threads.")
-            mde.PostEvent(self.ShutdownUploadsEvent(completed=True))
+            mde.PostEvent(MYDATA_EVENTS.ShutdownUploadsEvent(completed=True))
         elif not wx.PyApp.IsMainLoopRunning() and FLAGS.testRunRunning and \
                 finishedVerificationCounting:
-            mde.PostEvent(self.ShutdownUploadsEvent(completed=True))
+            mde.PostEvent(MYDATA_EVENTS.ShutdownUploadsEvent(completed=True))
 
     def ShutDownUploadThreads(self, event=None):
         """
@@ -772,8 +784,7 @@ class FoldersController(object):
             if self.IsShuttingDown():
                 return
             self.verifyDatafileRunnable[folderModel].append(
-                VerifyDatafileRunnable(
-                    self, self.foldersModel, folderModel, dfi))
+                VerifyDatafileRunnable(folderModel, dfi))
             if wx.PyApp.IsMainLoopRunning():
                 self.verificationsQueue\
                     .put(self.verifyDatafileRunnable[folderModel][dfi])

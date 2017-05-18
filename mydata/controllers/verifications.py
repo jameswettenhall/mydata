@@ -18,12 +18,12 @@ class VerifyDatafileRunnable(object):
           Post FoundUnverifiedUnstagedEvent
 """
 import os
-import threading
 import traceback
 
 import wx
 
 from ..settings import SETTINGS
+from ..dataviewmodels.dataview import DATAVIEW_MODELS
 from ..models.settings.miscellaneous import MiscellaneousSettingsModel
 from ..models.replica import ReplicaModel
 from ..models.verification import VerificationModel
@@ -47,13 +47,9 @@ class VerifyDatafileRunnable(object):
     verified, and if not, whether they have been completely or
     partially uploaded.
     """
-    def __init__(self, foldersController, foldersModel, folderModel,
-                 dataFileIndex, testRun=False):
-        self.foldersController = foldersController
-        self.foldersModel = foldersModel
+    def __init__(self, folderModel, dataFileIndex, testRun=False):
         self.folderModel = folderModel
         self.dataFileIndex = dataFileIndex
-        self.verificationsModel = foldersController.verificationsModel
         self.verificationModel = None
         self.testRun = testRun
 
@@ -70,24 +66,19 @@ class VerifyDatafileRunnable(object):
         dataFileDirectory = \
             self.folderModel.GetDataFileDirectory(self.dataFileIndex)
         dataFileName = os.path.basename(dataFilePath)
-        fc = self.foldersController  # pylint: disable=invalid-name
-        if not hasattr(fc, "verificationsThreadingLock"):
-            fc.verificationsThreadingLock = threading.Lock()
-        fc.verificationsThreadingLock.acquire()
-        try:
+        verificationsModel = DATAVIEW_MODELS['verifications']
+        with LOCKS.addVerification:
             verificationDataViewId = \
-                self.verificationsModel.GetMaxDataViewId() + 1
+                verificationsModel.GetMaxDataViewId() + 1
             self.verificationModel = \
                 VerificationModel(dataViewId=verificationDataViewId,
                                   folderModel=self.folderModel,
                                   dataFileIndex=self.dataFileIndex)
-            self.verificationsModel.AddRow(self.verificationModel)
-        finally:
-            fc.verificationsThreadingLock.release()
+            verificationsModel.AddRow(self.verificationModel)
         self.verificationModel.message = \
             "Looking for matching file on MyTardis server..."
         self.verificationModel.status = VerificationStatus.IN_PROGRESS
-        self.verificationsModel.MessageUpdated(self.verificationModel)
+        verificationsModel.MessageUpdated(self.verificationModel)
 
         try:
             dataset = self.folderModel.datasetModel
@@ -101,7 +92,7 @@ class VerifyDatafileRunnable(object):
                     "Found datafile in verified-files cache."
                 self.verificationModel.status = \
                     VerificationStatus.FOUND_VERIFIED
-                self.verificationsModel.MessageUpdated(self.verificationModel)
+                verificationsModel.MessageUpdated(self.verificationModel)
                 self.HandleExistingVerifiedDatafile()
                 return
             existingDatafile = DataFileModel.GetDataFile(
@@ -110,7 +101,7 @@ class VerifyDatafileRunnable(object):
             self.verificationModel.message = \
                 "Found datafile on MyTardis server."
             self.verificationModel.status = VerificationStatus.FOUND_VERIFIED
-            self.verificationsModel.MessageUpdated(self.verificationModel)
+            verificationsModel.MessageUpdated(self.verificationModel)
             self.HandleExistingDatafile(existingDatafile)
         except DoesNotExist:
             self.HandleNonExistentDataFile()
@@ -121,13 +112,13 @@ class VerifyDatafileRunnable(object):
         """
         If file doesn't exist on the server, it needs to be uploaded.
         """
+        verificationsModel = DATAVIEW_MODELS['verifications']
         self.verificationModel.message = \
             "Didn't find datafile on MyTardis server."
         self.verificationModel.status = VerificationStatus.NOT_FOUND
-        self.verificationsModel.MessageUpdated(self.verificationModel)
-        self.verificationsModel.SetComplete(self.verificationModel)
-        event = self.foldersController.DidntFindDatafileOnServerEvent(
-            foldersController=self.foldersController,
+        verificationsModel.MessageUpdated(self.verificationModel)
+        verificationsModel.SetComplete(self.verificationModel)
+        event = MYDATA_EVENTS.DidntFindDatafileOnServerEvent(
             folderModel=self.folderModel,
             dataFileIndex=self.dataFileIndex,
             verificationModel=self.verificationModel)
@@ -158,7 +149,7 @@ class VerifyDatafileRunnable(object):
             "Found unverified datafile record on MyTardis."
         uploadToStagingRequest = SETTINGS.uploaderModel.uploadToStagingRequest
 
-        if self.foldersController.uploadMethod == \
+        if wx.GetApp().foldersController.uploadMethod == \
                 UploadMethod.VIA_STAGING and \
                 uploadToStagingRequest is not None and \
                 uploadToStagingRequest.approved and \
@@ -209,14 +200,15 @@ class VerifyDatafileRunnable(object):
         in staging, then we can request its verification, but no upload
         is needed.
         """
+        verificationsModel = DATAVIEW_MODELS['verifications']
         dataFilePath = self.folderModel.GetDataFilePath(self.dataFileIndex)
         self.verificationModel.message = \
             "Found unverified full-size datafile on staging server."
         self.verificationModel.status = \
             VerificationStatus.FOUND_UNVERIFIED_FULL_SIZE
-        self.verificationsModel.MessageUpdated(self.verificationModel)
+        verificationsModel.MessageUpdated(self.verificationModel)
         self.folderModel.SetDataFileUploaded(self.dataFileIndex, True)
-        self.foldersModel.FolderStatusUpdated(self.folderModel)
+        DATAVIEW_MODELS['folders'].FolderStatusUpdated(self.folderModel)
         if existingDatafile and not self.testRun:
             if existingDatafile.md5sum == \
                     MiscellaneousSettingsModel.GetFakeMd5Sum():
@@ -224,8 +216,8 @@ class VerifyDatafileRunnable(object):
                                (dataFilePath, existingDatafile.md5sum))
             else:
                 DataFileModel.Verify(existingDatafile.datafileId)
-        self.verificationsModel.SetComplete(self.verificationModel)
-        PostEvent(self.foldersController.FoundFullSizeStagedEvent(
+        verificationsModel.SetComplete(self.verificationModel)
+        PostEvent(MYDATA_EVENTS.FoundFullSizeStagedEvent(
             folderModel=self.folderModel, dataFileIndex=self.dataFileIndex,
             dataFilePath=dataFilePath))
         if self.testRun:
@@ -238,20 +230,20 @@ class VerifyDatafileRunnable(object):
         """
         Re-upload file (resuming partial uploads is not supported).
         """
+        verificationsModel = DATAVIEW_MODELS['verifications']
         dataFilePath = self.folderModel.GetDataFilePath(self.dataFileIndex)
         self.verificationModel.message = \
             "Found partially uploaded datafile on staging server."
         self.verificationModel.status = \
             VerificationStatus.FOUND_UNVERIFIED_NOT_FULL_SIZE
-        self.verificationsModel.MessageUpdated(self.verificationModel)
+        verificationsModel.MessageUpdated(self.verificationModel)
         logger.debug("Re-uploading \"%s\" to staging, because "
                      "the file size is %s bytes in staging, "
                      "but it should be %s bytes."
                      % (dataFilePath, bytesUploadedPreviously,
                         existingDatafile.size))
-        self.verificationsModel.SetComplete(self.verificationModel)
-        PostEvent(self.foldersController.FoundIncompleteStagedEvent(
-            foldersController=self.foldersController,
+        verificationsModel.SetComplete(self.verificationModel)
+        PostEvent(MYDATA_EVENTS.FoundIncompleteStagedEvent(
             folderModel=self.folderModel, dataFileIndex=self.dataFileIndex,
             existingUnverifiedDatafile=existingDatafile,
             bytesUploadedPreviously=bytesUploadedPreviously,
@@ -267,15 +259,16 @@ class VerifyDatafileRunnable(object):
         Or we could be using the STAGING method but failed to find any
         DataFileObjects on the server for the datafile.
         """
+        verificationsModel = DATAVIEW_MODELS['verifications']
         dataFilePath = self.folderModel.GetDataFilePath(self.dataFileIndex)
         logger.debug("Found unverified datafile record for \"%s\" "
                      "on MyTardis." % dataFilePath)
         self.verificationModel.message = "Found unverified datafile record."
         self.folderModel.SetDataFileUploaded(self.dataFileIndex, True)
-        self.foldersModel.FolderStatusUpdated(self.folderModel)
+        DATAVIEW_MODELS['folders'].FolderStatusUpdated(self.folderModel)
         self.verificationModel.status = \
             VerificationStatus.FOUND_UNVERIFIED_UNSTAGED
-        self.verificationsModel.MessageUpdated(self.verificationModel)
+        verificationsModel.MessageUpdated(self.verificationModel)
         if existingDatafile and not self.testRun:
             if existingDatafile.md5sum == \
                     MiscellaneousSettingsModel.GetFakeMd5Sum():
@@ -283,8 +276,8 @@ class VerifyDatafileRunnable(object):
                                (dataFilePath, existingDatafile.md5sum))
             else:
                 DataFileModel.Verify(existingDatafile.datafileId)
-        self.verificationsModel.SetComplete(self.verificationModel)
-        PostEvent(self.foldersController.FoundUnverifiedUnstagedEvent(
+        verificationsModel.SetComplete(self.verificationModel)
+        PostEvent(MYDATA_EVENTS.FoundUnverifiedUnstagedEvent(
             folderModel=self.folderModel, dataFileIndex=self.dataFileIndex,
             dataFilePath=dataFilePath))
         if self.testRun:
@@ -296,16 +289,17 @@ class VerifyDatafileRunnable(object):
         """
         Found existing verified file on server.
         """
+        verificationsModel = DATAVIEW_MODELS['verifications']
         dataFilePath = self.folderModel.GetDataFilePath(self.dataFileIndex)
         cacheKey = "%s,%s" % (self.folderModel.datasetModel.datasetId,
                               dataFilePath.encode('utf8'))
         if SETTINGS.miscellaneous.cacheDataFileLookups:
-            with LOCKS.updateCacheLock:
+            with LOCKS.updateCache:
                 SETTINGS.verifiedDatafilesCache[cacheKey] = True
         self.folderModel.SetDataFileUploaded(self.dataFileIndex, True)
-        self.foldersModel.FolderStatusUpdated(self.folderModel)
-        self.verificationsModel.SetComplete(self.verificationModel)
-        PostEvent(self.foldersController.FoundVerifiedDatafileEvent(
+        DATAVIEW_MODELS['folders'].FolderStatusUpdated(self.folderModel)
+        verificationsModel.SetComplete(self.verificationModel)
+        PostEvent(MYDATA_EVENTS.FoundVerifiedDatafileEvent(
             folderModel=self.folderModel, dataFileIndex=self.dataFileIndex,
             dataFilePath=dataFilePath))
         if self.testRun:
